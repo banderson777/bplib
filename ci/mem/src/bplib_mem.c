@@ -306,6 +306,42 @@ BPLib_Status_t BPLib_MEM_BlobCopyOut(BPLib_Bundle_t* bundle, void* out_buffer, s
 }
 
 
+/** Locate and validate a complete byte span before a reader or writer copies data. */
+static BPLib_Status_t locate_span(BPLib_Bundle_t *bundle, uint64_t start, uint64_t length,
+                                  BPLib_MEM_Block_t **first, uint64_t *position)
+{
+    BPLib_MEM_Block_t *block = bundle->blob;
+    uint64_t skip = start;
+    while (block && skip >= block->used_len)
+    {
+        skip -= block->used_len;
+        block = block->next;
+    }
+    *first = block;
+    *position = skip;
+    if (!block)
+    {
+        return skip == 0 && length == 0 ? BPLIB_SUCCESS : BPLIB_BUF_LEN_ERROR;
+    }
+
+    /* Validate the entire range before exposing any bytes to the caller.
+     * Allocation capacity includes unused bytes and is not the blob length. */
+    uint64_t remaining = length;
+    uint64_t offset = skip;
+    BPLib_MEM_Block_t *probe = block;
+    while (probe && remaining)
+    {
+        uint64_t available = probe->used_len - offset;
+        if (available > remaining) available = remaining;
+        remaining -= available;
+        probe = probe->next;
+        offset = 0;
+    }
+    if (remaining) return BPLIB_MEM_CPY_FRM_OFFSET_NE_ERR;
+
+    return BPLIB_SUCCESS;
+}
+
 /** Copy an exact range from the bundle’s blob across block boundaries. Reject invalid ranges
  * and insufficient caller storage before copying. */
 BPLib_Status_t BPLib_MEM_CopyOutFromOffset(BPLib_Bundle_t* Bundle, uint64_t Offset,
@@ -320,35 +356,12 @@ BPLib_Status_t BPLib_MEM_CopyOutFromOffset(BPLib_Bundle_t* Bundle, uint64_t Offs
         return BPLIB_BUF_LEN_ERROR;
     }
 
-    BPLib_MEM_Block_t *block = Bundle->blob;
-    uint64_t skip = Offset;
-    while (block && skip >= block->used_len)
-    {
-        skip -= block->used_len;
-        block = block->next;
-    }
-    if (!block)
-    {
-        return skip == 0 && NumBytesToCopy == 0 ? BPLIB_SUCCESS : BPLIB_BUF_LEN_ERROR;
-    }
-
-    /* Validate the entire range before exposing any bytes to the caller.
-     * Allocation capacity includes unused bytes and is not the blob length. */
-    uint64_t remaining = NumBytesToCopy;
-    uint64_t offset = skip;
-    BPLib_MEM_Block_t *probe = block;
-    while (probe && remaining)
-    {
-        uint64_t available = probe->used_len - offset;
-        if (available > remaining) available = remaining;
-        remaining -= available;
-        probe = probe->next;
-        offset = 0;
-    }
-    if (remaining) return BPLIB_MEM_CPY_FRM_OFFSET_NE_ERR;
-
+    BPLib_MEM_Block_t *block;
+    uint64_t skip;
+    BPLib_Status_t status = locate_span(Bundle, Offset, NumBytesToCopy, &block, &skip);
+    if (status != BPLIB_SUCCESS) return status;
     uint8_t *output = OutputBuffer;
-    remaining = NumBytesToCopy;
+    uint64_t remaining = NumBytesToCopy;
     while (remaining)
     {
         size_t count = block->used_len - (size_t)skip;
@@ -428,7 +441,11 @@ BPLib_Status_t BPLib_BlockWriterOpen(BPLib_Bundle_t *bundle, uint64_t num, size_
 {
     BPLib_CanBlockHeader_t *h = BPLib_BlockHeaderFind(bundle, num);
     if (!h || !writer || !bundle->blob || len != h->DataSize) return BPLIB_BUF_LEN_ERROR;
-    writer->staging = malloc(len);
+    BPLib_MEM_Block_t *first;
+    uint64_t position;
+    BPLib_Status_t status = locate_span(bundle, h->DataOffsetStart, len, &first, &position);
+    if (status != BPLIB_SUCCESS) return status;
+    writer->staging = malloc(len ? len : 1);
     if (!writer->staging) return BPLIB_ERROR;
     writer->bundle = bundle; writer->offset = h->DataOffsetStart; writer->remaining = len; writer->total = len; writer->block_num = num; writer->written = 0;
     return BPLIB_SUCCESS;
@@ -451,17 +468,33 @@ BPLib_Status_t BPLib_BlockWriterWrite(BPLib_BlockWriter_t *writer, const void *b
 BPLib_Status_t BPLib_BlockWriterClose(BPLib_BlockWriter_t *writer, bool success)
 {
     if (!writer) return BPLIB_NULL_PTR_ERROR;
-    if (success && writer->remaining != 0) { free(writer->staging); return BPLIB_BUF_LEN_ERROR; }
+    BPLib_Status_t status = BPLIB_SUCCESS;
     if (success)
     {
-        BPLib_CanBlockHeader_t *h = BPLib_BlockHeaderFind(writer->bundle, writer->block_num);
-        if (h) h->RequiresEncode = true;
-        BPLib_MEM_Block_t *blk = writer->bundle->blob;
-        uint64_t skip = h ? h->DataOffsetStart : 0;
-        while (blk && skip >= blk->used_len) { skip -= blk->used_len; blk = blk->next; }
-        size_t left = writer->total; const uint8_t *src = writer->staging;
-        while (blk && left) { size_t n = blk->used_len - (size_t)skip; if (n > left) n = left; memcpy(blk->user_data.BigData + skip, src, n); src += n; left -= n; blk = blk->next; skip = 0; }
+        BPLib_CanBlockHeader_t *header = BPLib_BlockHeaderFind(writer->bundle, writer->block_num);
+        BPLib_MEM_Block_t *block;
+        uint64_t skip;
+        if (!header || writer->remaining || header->DataOffsetStart != writer->offset ||
+            header->DataSize != writer->total)
+            status = BPLIB_BUF_LEN_ERROR;
+        else
+            status = locate_span(writer->bundle, writer->offset, writer->total, &block, &skip);
+        if (status == BPLIB_SUCCESS)
+        {
+            size_t left = writer->total;
+            while (left)
+            {
+                size_t count = block->used_len - (size_t)skip;
+                if (count > left) count = left;
+                memcpy(block->user_data.BigData + skip, writer->staging + writer->total - left, count);
+                left -= count;
+                block = block->next;
+                skip = 0;
+            }
+            header->RequiresEncode = true;
+        }
     }
-    free(writer->staging); writer->staging = NULL;
-    return BPLIB_SUCCESS;
+    free(writer->staging);
+    writer->staging = NULL;
+    return status;
 }
